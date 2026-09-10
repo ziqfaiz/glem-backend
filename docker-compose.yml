@@ -1,0 +1,9 @@
+services:
+  api:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env before starting the API}
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
