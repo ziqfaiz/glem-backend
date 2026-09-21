@@ -10,24 +10,25 @@ docker compose up --build
 
 Then open:
 
-- API documentation: http://localhost:8000/docs
-- Health check: http://localhost:8000/health
+- API documentation: http://localhost:8002/docs
+- Health check: http://localhost:8002/health
 Copy `.env.example` to `.env`, replace `CHANGE_ME` with the RDS password, and keep
 the resulting `.env` file private. It is excluded from Git.
 
 ## API
 
 The backend exposes two endpoints: `GET /health` checks the database connection,
-and `POST /output/upsert` inserts or updates transformed output rows.
+and `POST /tables/replace` creates or replaces a table's rows.
 
 ```bash
-curl -X POST http://localhost:8000/output/upsert \
+curl -X POST http://localhost:8002/tables/replace \
   -H "Content-Type: application/json" \
-  -d '{"$items":[{"uuid":"2aaad9ed-b503-49da-9c74-e15294db42b6","sender_id":"S001","sender_name":"Alice Tan","trx_date":"2026-09-09T09:15:00","receiver_id":"R001","receiver_name":"Bob Lee","type":"TRANSFER","dc":"D","amount":1250,"status":"COMPLETED","created_dt":"2026-09-09"}]}'
+  -d '{"table_name":"glem_transactions","fields":[{"sender_id":"S001","amount":1250,"status":"COMPLETED"},{"sender_id":"S002","amount":850,"status":"PENDING"}]}'
 ```
 
-Rows are uniquely identified by `(uuid, created_dt)`. Sending that key again updates
-the existing row. Each request accepts between 1 and 1,000 items.
+For a new table, column types are inferred from the supplied values. If the table
+already exists, its rows are truncated before the supplied fields are inserted. Table
+and field names must use lowercase letters, digits, and underscores only.
 
 ## Database tables
 
