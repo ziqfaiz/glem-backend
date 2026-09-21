@@ -4,6 +4,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    """Load validated application settings from environment variables or `.env`."""
+
     app_name: str = "Glem Destination API"
     database_url: str
 
@@ -12,4 +14,5 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """Return one cached settings instance for the lifetime of this process."""
     return Settings()

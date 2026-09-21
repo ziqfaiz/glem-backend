@@ -34,6 +34,7 @@ app = FastAPI(title=get_settings().app_name, version="2.0.0")
 
 
 def validate_identifier(value: str, label: str) -> str:
+    """Reject unsafe SQL table and column identifiers supplied by a request."""
     if not IDENTIFIER_PATTERN.fullmatch(value):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -46,10 +47,12 @@ def validate_identifier(value: str, label: str) -> str:
 
 
 def infer_column_type(values: list[Any]):
+    """Infer one SQLAlchemy column type from all non-null values for one field."""
     non_null_values = [value for value in values if value is not None]
     if not non_null_values:
         return Text
 
+    # A set makes it possible to detect whether values share one compatible type.
     value_types = {type(value) for value in non_null_values}
     if value_types == {bool}:
         return Boolean
@@ -69,6 +72,7 @@ def infer_column_type(values: list[Any]):
 
 
 def table_from_fields(table_name: str, fields: list[dict[str, Any]]) -> Table:
+    """Build an in-memory SQLAlchemy table definition from incoming row objects."""
     column_names = {column_name for row in fields for column_name in row}
     if not column_names:
         raise HTTPException(
@@ -79,6 +83,7 @@ def table_from_fields(table_name: str, fields: list[dict[str, Any]]) -> Table:
     columns = []
     for column_name in sorted(column_names):
         validate_identifier(column_name, "Field name")
+        # Missing values are stored as NULL; their type is inferred from other rows.
         values = [row.get(column_name) for row in fields]
         columns.append(Column(column_name, infer_column_type(values), nullable=True))
 
@@ -87,6 +92,7 @@ def table_from_fields(table_name: str, fields: list[dict[str, Any]]) -> Table:
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)) -> dict[str, str]:
+    """Return success only when the API can execute a query against PostgreSQL."""
     db.execute(text("SELECT 1"))
     return {"status": "ok", "database": "connected"}
 
@@ -100,8 +106,10 @@ def replace_table(
     request: TableReplaceRequest,
     db: Session = Depends(get_db),
 ) -> TableReplaceResponse:
+    """Create a table or truncate an existing one, then insert all request rows."""
     table_name = validate_identifier(request.table_name, "table_name")
     connection = db.connection()
+    # Reflection checks table existence before deciding whether to create or replace.
     inspector = inspect(connection)
     table_exists = inspector.has_table(table_name, schema=SCHEMA_NAME)
 
@@ -113,6 +121,7 @@ def replace_table(
                 schema=SCHEMA_NAME,
                 autoload_with=connection,
             )
+            # Existing tables keep their schema; new/unrecognized fields are rejected.
             incoming_columns = {
                 column_name for row in request.fields for column_name in row
             }
@@ -126,6 +135,7 @@ def replace_table(
                     ),
                 )
 
+            # Quote validated identifiers before building the PostgreSQL TRUNCATE command.
             preparer = connection.dialect.identifier_preparer
             qualified_table_name = ".".join(
                 (preparer.quote(SCHEMA_NAME), preparer.quote(table_name))
@@ -135,6 +145,7 @@ def replace_table(
             table = table_from_fields(table_name, request.fields)
             table.create(bind=connection)
 
+        # DDL/DML run in one transaction: a failed insert rolls back the truncate/create.
         db.execute(table.insert(), request.fields)
         db.commit()
     except HTTPException:
@@ -152,4 +163,3 @@ def replace_table(
         created=not table_exists,
         rows_written=len(request.fields),
     )
-
