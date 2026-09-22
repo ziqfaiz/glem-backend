@@ -1,0 +1,17 @@
+{
+  "table_name": "postman_test_transactions",
+  "fields": [
+    {
+      "sender_id": "S001",
+      "sender_name": "Alice Tan",
+      "amount": 9999,
+      "status": "COMPLETED"
+    },
+    {
+      "sender_id": "S002",
+      "sender_name": "Bob Lee",
+      "amount": 850,
+      "status": "PENDING"
+    }
+  ]
+}

@@ -18,17 +18,19 @@ the resulting `.env` file private. It is excluded from Git.
 ## API
 
 The backend exposes two endpoints: `GET /health` checks the database connection,
-and `POST /tables/replace` creates or replaces a table's rows.
+and `POST /tables/upsert` creates a keyed table or upserts its rows.
 
 ```bash
-curl -X POST http://localhost:8002/tables/replace \
+curl -X POST http://localhost:8002/tables/upsert \
   -H "Content-Type: application/json" \
-  -d '{"table_name":"glem_transactions","fields":[{"sender_id":"S001","amount":1250,"status":"COMPLETED"},{"sender_id":"S002","amount":850,"status":"PENDING"}]}'
+  -d '{"table_name":"glem_transactions","primary_key":"transaction_id","fields":[{"transaction_id":"TX001","amount":1250,"status":"COMPLETED"},{"transaction_id":"TX002","amount":850,"status":"PENDING"}]}'
 ```
 
-For a new table, column types are inferred from the supplied values. If the table
-already exists, its rows are truncated before the supplied fields are inserted. Table
-and field names must use lowercase letters, digits, and underscores only.
+For a new table, `primary_key` is required and becomes its primary-key column. If
+the table already exists, `primary_key` may be omitted and the API discovers the
+table's single primary key automatically. Incoming rows are inserted or updated by
+that key; rows not included in the request remain unchanged. Table, field, and
+primary-key names must use lowercase letters, digits, and underscores only.
 
 ## Database tables
 
