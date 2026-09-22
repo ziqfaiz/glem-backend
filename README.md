@@ -23,14 +23,16 @@ and `POST /tables/upsert` creates a keyed table or upserts its rows.
 ```bash
 curl -X POST http://localhost:8002/tables/upsert \
   -H "Content-Type: application/json" \
-  -d '{"table_name":"glem_transactions","primary_key":"transaction_id","fields":[{"transaction_id":"TX001","amount":1250,"status":"COMPLETED"},{"transaction_id":"TX002","amount":850,"status":"PENDING"}]}'
+  -d '{"schema":"public","table_name":"glem_transactions","primary_key":"transaction_id","rows":[{"transaction_id":"TX001","amount":1250,"status":"COMPLETED"},{"transaction_id":"TX002","amount":850,"status":"PENDING"}]}'
 ```
 
-For a new table, `primary_key` is required and becomes its primary-key column. If
-the table already exists, `primary_key` may be omitted and the API discovers the
-table's single primary key automatically. Incoming rows are inserted or updated by
-that key; rows not included in the request remain unchanged. Table, field, and
-primary-key names must use lowercase letters, digits, and underscores only.
+`schema` selects an existing PostgreSQL schema, such as `public`. For a new table,
+`primary_key` is required and becomes its primary-key column. If the table already
+exists, `primary_key` may be omitted and the API discovers the table's single
+primary key automatically. Incoming rows are inserted or updated by that key; rows
+not included in the request remain unchanged. New-table columns keep the order in
+which their names first appear in `rows`. Schema, table, field, and primary-key names
+must use lowercase letters, digits, and underscores only.
 
 ## Database tables
 
