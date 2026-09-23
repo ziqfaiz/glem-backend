@@ -17,6 +17,7 @@ from sqlalchemy import (
     inspect,
     select,
     text,
+    tuple_,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID, insert
 from sqlalchemy.exc import SQLAlchemyError
@@ -24,7 +25,13 @@ from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .database import get_db
-from .schemas import TableUpsertRequest, TableUpsertResponse
+from .schemas import (
+    SourceColumn,
+    TableCreateRequest,
+    TableCreateResponse,
+    TableUpsertRequest,
+    TableUpsertResponse,
+)
 
 
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,62}$")
@@ -46,69 +53,44 @@ def validate_identifier(value: str, label: str) -> str:
     return value
 
 
-def infer_column_type(values: list[Any]):
-    """Infer one SQLAlchemy column type from all non-null values for one field."""
-    non_null_values = [value for value in values if value is not None]
-    if not non_null_values:
-        return Text
-
-    value_types = {type(value) for value in non_null_values}
-    if value_types == {bool}:
-        return Boolean
-    if value_types <= {int}:
-        return BigInteger
-    if value_types <= {int, float}:
-        return Float
-    if all(is_uuid_value(value) for value in non_null_values):
-        return PG_UUID(as_uuid=True)
-    if all(is_datetime_value(value) for value in non_null_values):
-        return DateTime(timezone=True)
-    if all(is_date_value(value) for value in non_null_values):
-        return Date
-    if all(isinstance(value, (dict, list)) for value in non_null_values):
-        return JSONB
-    return Text
-
-
-def is_uuid_value(value: Any) -> bool:
-    """Return whether a value is a UUID object or a valid UUID string."""
-    if isinstance(value, UUID):
-        return True
-    if not isinstance(value, str):
-        return False
-    try:
-        UUID(value)
-        return True
-    except ValueError:
-        return False
-
-
-def is_datetime_value(value: Any) -> bool:
-    """Return whether a value is a datetime object or an ISO-8601 timestamp."""
-    if isinstance(value, datetime):
-        return True
-    if not isinstance(value, str) or "T" not in value:
-        return False
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return True
-    except ValueError:
-        return False
-
-
-def is_date_value(value: Any) -> bool:
-    """Return whether a value is a date object or an ISO-8601 date string."""
-    if isinstance(value, datetime):
-        return False
-    if isinstance(value, date):
-        return True
-    if not isinstance(value, str):
-        return False
-    try:
-        date.fromisoformat(value)
-        return True
-    except ValueError:
-        return False
+def source_data_type_to_sqlalchemy(data_type: str):
+    """Map supported source metadata types to the corresponding PostgreSQL type."""
+    normalized_type = " ".join(data_type.upper().split())
+    type_map = {
+        "VARCHAR": Text,
+        "CHARACTER VARYING": Text,
+        "CHAR": Text,
+        "CHARACTER": Text,
+        "TEXT": Text,
+        "STRING": Text,
+        "BOOLEAN": Boolean,
+        "BOOL": Boolean,
+        "SMALLINT": BigInteger,
+        "INTEGER": BigInteger,
+        "INT": BigInteger,
+        "BIGINT": BigInteger,
+        "FLOAT": Float,
+        "REAL": Float,
+        "DOUBLE": Float,
+        "DOUBLE PRECISION": Float,
+        "DECIMAL": Float,
+        "NUMERIC": Float,
+        "DATE": Date,
+        "TIMESTAMP": DateTime,
+        "DATETIME": DateTime,
+        "TIMESTAMPTZ": lambda: DateTime(timezone=True),
+        "TIMESTAMP WITH TIME ZONE": lambda: DateTime(timezone=True),
+        "UUID": lambda: PG_UUID(as_uuid=True),
+        "JSON": JSONB,
+        "JSONB": JSONB,
+    }
+    sqlalchemy_type = type_map.get(normalized_type)
+    if sqlalchemy_type is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unsupported source data_type: {data_type!r}.",
+        )
+    return sqlalchemy_type()
 
 
 def coerce_value_for_column(value: Any, column_type: Any) -> Any:
@@ -136,39 +118,57 @@ def column_names_in_request_order(rows: list[dict[str, Any]]) -> list[str]:
     return ordered_columns
 
 
-def table_from_rows(
+def table_from_source_columns(
     schema_name: str,
     table_name: str,
-    primary_key: str,
-    rows: list[dict[str, Any]],
-    column_names: list[str],
+    primary_key: list[str],
+    source_columns: list[SourceColumn],
 ) -> Table:
-    """Build a table definition that preserves incoming JSON field order."""
-    if not column_names:
+    """Build a table definition from ordered source-system column metadata."""
+    column_names = [column.column_name for column in source_columns]
+    if len(set(column_names)) != len(column_names):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="rows must contain at least one column.",
+            detail="columns must not contain duplicate column_name values.",
         )
-    if primary_key not in column_names:
+    if len(set(primary_key)) != len(primary_key):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="primary_key must be present in rows.",
+            detail="primary_key must not contain duplicate column names.",
         )
-    if any(primary_key not in row or row[primary_key] is None for row in rows):
+    missing_primary_keys = set(primary_key) - set(column_names)
+    if missing_primary_keys:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Every row must contain a non-null primary_key value.",
+            detail=(
+                "primary_key columns must be present in columns: "
+                f"{', '.join(sorted(missing_primary_keys))}."
+            ),
+        )
+    positions = [column.ordinal_position for column in source_columns]
+    if len(set(positions)) != len(positions):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="columns must not contain duplicate ordinal_position values.",
         )
 
     columns = []
-    for column_name in column_names:
-        values = [row.get(column_name) for row in rows]
+    for source_column in sorted(source_columns, key=lambda column: column.ordinal_position):
+        column_name = source_column.column_name
+        nullable_value = source_column.is_nullable.upper()
+        if nullable_value not in {"YES", "NO"}:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"is_nullable for {column_name!r} must be 'YES' or 'NO'."
+                ),
+            )
         columns.append(
             Column(
                 column_name,
-                infer_column_type(values),
-                primary_key=column_name == primary_key,
-                nullable=column_name != primary_key,
+                source_data_type_to_sqlalchemy(source_column.data_type),
+                primary_key=column_name in primary_key,
+                nullable=False if column_name in primary_key else nullable_value == "YES",
             )
         )
 
@@ -191,36 +191,30 @@ def normalized_rows(
 
 
 def deduplicate_rows_by_primary_key(
-    rows: list[dict[str, Any]], primary_key: str
+    rows: list[dict[str, Any]], primary_key: list[str]
 ) -> list[dict[str, Any]]:
-    """Keep the final row for a repeated key, preventing one batch conflict error."""
-    if any(isinstance(row[primary_key], (dict, list)) for row in rows):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="primary_key values must be scalar values, not objects or arrays.",
-        )
-    return list({row[primary_key]: row for row in rows}.values())
+    """Keep the final row for each single or composite primary-key value."""
+    rows_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        key_values = tuple(row[column_name] for column_name in primary_key)
+        if any(isinstance(value, (dict, list)) for value in key_values):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="primary_key values must be scalar values, not objects or arrays.",
+            )
+        rows_by_key[key_values] = row
+    return list(rows_by_key.values())
 
 
-def resolve_existing_primary_key(table: Table, requested_key: str | None) -> str:
-    """Use a supplied key or discover the single primary key on an existing table."""
+def resolve_existing_primary_key(table: Table) -> list[str]:
+    """Discover the primary-key column or columns defined on an existing table."""
     existing_keys = list(table.primary_key.columns.keys())
-    if len(existing_keys) != 1:
+    if not existing_keys:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Existing table must have exactly one primary-key column.",
+            detail="Existing table must have at least one primary-key column.",
         )
-
-    existing_key = existing_keys[0]
-    if requested_key is not None and requested_key != existing_key:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                f"Existing table primary key is {existing_key!r}, not "
-                f"{requested_key!r}."
-            ),
-        )
-    return existing_key
+    return existing_keys
 
 
 @app.get("/health")
@@ -228,6 +222,63 @@ def health(db: Session = Depends(get_db)) -> dict[str, str]:
     """Return success only when the API can execute a query against PostgreSQL."""
     db.execute(text("SELECT 1"))
     return {"status": "ok", "database": "connected"}
+
+
+@app.post(
+    "/tables/create",
+    response_model=TableCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_table(
+    request: TableCreateRequest,
+    db: Session = Depends(get_db),
+) -> TableCreateResponse:
+    """Create a new keyed table from source-system column metadata."""
+    schema_name = validate_identifier(request.schema_name, "schema")
+    table_name = validate_identifier(request.table_name, "table_name")
+    primary_key = [
+        validate_identifier(column_name, "primary_key")
+        for column_name in request.primary_key
+    ]
+    for source_column in request.columns:
+        column_name = source_column.column_name
+        validate_identifier(column_name, "Field name")
+
+    connection = db.connection()
+    inspector = inspect(connection)
+    if not inspector.has_schema(schema_name):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Schema {schema_name!r} does not exist.",
+        )
+    if inspector.has_table(table_name, schema=schema_name):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Table {schema_name}.{table_name} already exists.",
+        )
+
+    try:
+        table = table_from_source_columns(
+            schema_name, table_name, primary_key, request.columns
+        )
+        table.create(bind=connection)
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except SQLAlchemyError as error:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database operation failed.",
+        ) from error
+
+    return TableCreateResponse(
+        schema_name=schema_name,
+        table_name=table_name,
+        primary_key=primary_key,
+        created=True,
+    )
 
 
 @app.post(
@@ -239,14 +290,9 @@ def upsert_table(
     request: TableUpsertRequest,
     db: Session = Depends(get_db),
 ) -> TableUpsertResponse:
-    """Create a keyed table or upsert request rows into an existing table."""
+    """Insert or update rows in an existing table using its primary key."""
     schema_name = validate_identifier(request.schema_name, "schema")
     table_name = validate_identifier(request.table_name, "table_name")
-    requested_key = (
-        validate_identifier(request.primary_key, "primary_key")
-        if request.primary_key is not None
-        else None
-    )
     column_names = column_names_in_request_order(request.rows)
     for column_name in column_names:
         validate_identifier(column_name, "Field name")
@@ -258,75 +304,80 @@ def upsert_table(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Schema {schema_name!r} does not exist.",
         )
-    table_exists = inspector.has_table(table_name, schema=schema_name)
+    if not inspector.has_table(table_name, schema=schema_name):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Table {schema_name}.{table_name} does not exist. Create it first.",
+        )
 
     try:
-        if table_exists:
-            table = Table(
-                table_name,
-                MetaData(),
-                schema=schema_name,
-                autoload_with=connection,
-            )
-            unknown_columns = set(column_names) - set(table.c.keys())
-            if unknown_columns:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail=(
-                        "Incoming rows contain fields that do not exist in the table: "
-                        f"{', '.join(sorted(unknown_columns))}."
-                    ),
-                )
-            primary_key = resolve_existing_primary_key(table, requested_key)
-        else:
-            if requested_key is None:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="primary_key is required when creating a new table.",
-                )
-            primary_key = requested_key
-            table = table_from_rows(
-                schema_name, table_name, primary_key, request.rows, column_names
-            )
-            table.create(bind=connection)
-
-        if any(primary_key not in row or row[primary_key] is None for row in request.rows):
+        table = Table(
+            table_name,
+            MetaData(),
+            schema=schema_name,
+            autoload_with=connection,
+        )
+        unknown_columns = set(column_names) - set(table.c.keys())
+        if unknown_columns:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Every row must contain a non-null primary_key value.",
+                detail=(
+                    "Incoming rows contain fields that do not exist in the table: "
+                    f"{', '.join(sorted(unknown_columns))}."
+                ),
+            )
+        primary_key = resolve_existing_primary_key(table)
+
+        if any(
+            any(column_name not in row or row[column_name] is None for column_name in primary_key)
+            for row in request.rows
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Every row must contain non-null values for every primary-key column.",
             )
 
         unique_rows = deduplicate_rows_by_primary_key(request.rows, primary_key)
         rows = normalized_rows(unique_rows, column_names, table)
-        if table_exists:
-            existing_keys = set(
-                db.scalars(
-                    select(table.c[primary_key]).where(
-                        table.c[primary_key].in_([row[primary_key] for row in rows])
+        primary_key_columns = [table.c[column_name] for column_name in primary_key]
+        incoming_keys = [
+            tuple(row[column_name] for column_name in primary_key) for row in rows
+        ]
+        if len(primary_key_columns) == 1:
+            existing_keys = {
+                (value,)
+                for value in db.scalars(
+                    select(primary_key_columns[0]).where(
+                        primary_key_columns[0].in_([key[0] for key in incoming_keys])
                     )
                 ).all()
-            )
-            rows_updated = sum(
-                row[primary_key] in existing_keys for row in rows
-            )
+            }
         else:
-            rows_updated = 0
+            existing_keys = {
+                tuple(row)
+                for row in db.execute(
+                    select(*primary_key_columns).where(
+                        tuple_(*primary_key_columns).in_(incoming_keys)
+                    )
+                ).all()
+            }
+        rows_updated = sum(key in existing_keys for key in incoming_keys)
         rows_inserted = len(rows) - rows_updated
 
         statement = insert(table).values(rows)
         update_columns = {
             column_name: statement.excluded[column_name]
             for column_name in column_names
-            if column_name != primary_key
+            if column_name not in primary_key
         }
         if update_columns:
             statement = statement.on_conflict_do_update(
-                index_elements=[table.c[primary_key]],
+                index_elements=primary_key_columns,
                 set_=update_columns,
             )
         else:
             statement = statement.on_conflict_do_nothing(
-                index_elements=[table.c[primary_key]]
+                index_elements=primary_key_columns
             )
 
         db.execute(statement)
@@ -345,7 +396,6 @@ def upsert_table(
         schema_name=schema_name,
         table_name=table_name,
         primary_key=primary_key,
-        created=not table_exists,
         rows_inserted=rows_inserted,
         rows_updated=rows_updated,
     )

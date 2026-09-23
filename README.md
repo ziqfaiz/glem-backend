@@ -17,22 +17,32 @@ the resulting `.env` file private. It is excluded from Git.
 
 ## API
 
-The backend exposes two endpoints: `GET /health` checks the database connection,
-and `POST /tables/upsert` creates a keyed table or upserts its rows.
+The backend exposes three endpoints: `GET /health` checks the database connection,
+`POST /tables` creates a table, and `POST /tables/upsert` writes rows to an
+existing table.
+
+```bash
+curl -X POST http://localhost:8002/tables \
+  -H "Content-Type: application/json" \
+  -d '{"schema":"public","table_name":"glem_transactions","primary_key":["transaction_id"],"columns":[{"column_name":"transaction_id","ordinal_position":1,"data_type":"VARCHAR","is_nullable":"NO"},{"column_name":"amount","ordinal_position":2,"data_type":"DOUBLE","is_nullable":"YES"}]}'
+```
+
+`POST /tables` requires `schema`, `table_name`, a `primary_key` array, and source
+column metadata in `columns`. It creates the table only and returns `409` when the
+table already exists. Each column uses `column_name`, `ordinal_position`, `data_type`,
+and `is_nullable`; unrelated metadata fields are ignored. Column order follows
+`ordinal_position`. Composite primary keys are supported.
 
 ```bash
 curl -X POST http://localhost:8002/tables/upsert \
   -H "Content-Type: application/json" \
-  -d '{"schema":"public","table_name":"glem_transactions","primary_key":"transaction_id","rows":[{"transaction_id":"TX001","amount":1250,"status":"COMPLETED"},{"transaction_id":"TX002","amount":850,"status":"PENDING"}]}'
+  -d '{"schema":"public","table_name":"glem_transactions","rows":[{"transaction_id":"TX001","amount":1250,"status":"COMPLETED"}]}'
 ```
 
-`schema` selects an existing PostgreSQL schema, such as `public`. For a new table,
-`primary_key` is required and becomes its primary-key column. If the table already
-exists, `primary_key` may be omitted and the API discovers the table's single
-primary key automatically. Incoming rows are inserted or updated by that key; rows
-not included in the request remain unchanged. New-table columns keep the order in
-which their names first appear in `rows`. Schema, table, field, and primary-key names
-must use lowercase letters, digits, and underscores only.
+`POST /tables/upsert` requires an existing table and does not accept `primary_key`.
+It discovers the table's single primary key, then inserts new rows or updates matching
+rows. Schema, table, field, and primary-key names must start with a letter and may
+contain letters, digits, and underscores.
 
 ## Database tables
 
