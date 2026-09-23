@@ -27,7 +27,7 @@ from .database import get_db
 from .schemas import TableUpsertRequest, TableUpsertResponse
 
 
-IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,62}$")
 
 
 app = FastAPI(title=get_settings().app_name, version="4.0.0")
@@ -39,8 +39,8 @@ def validate_identifier(value: str, label: str) -> str:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
-                f"{label} must start with a lowercase letter and contain only "
-                "lowercase letters, numbers, and underscores."
+                f"{label} must start with a letter and contain only letters, "
+                "numbers, and underscores."
             ),
         )
     return value
@@ -59,15 +59,69 @@ def infer_column_type(values: list[Any]):
         return BigInteger
     if value_types <= {int, float}:
         return Float
-    if value_types == {UUID}:
+    if all(is_uuid_value(value) for value in non_null_values):
         return PG_UUID(as_uuid=True)
-    if value_types == {datetime}:
+    if all(is_datetime_value(value) for value in non_null_values):
         return DateTime(timezone=True)
-    if value_types == {date}:
+    if all(is_date_value(value) for value in non_null_values):
         return Date
     if all(isinstance(value, (dict, list)) for value in non_null_values):
         return JSONB
     return Text
+
+
+def is_uuid_value(value: Any) -> bool:
+    """Return whether a value is a UUID object or a valid UUID string."""
+    if isinstance(value, UUID):
+        return True
+    if not isinstance(value, str):
+        return False
+    try:
+        UUID(value)
+        return True
+    except ValueError:
+        return False
+
+
+def is_datetime_value(value: Any) -> bool:
+    """Return whether a value is a datetime object or an ISO-8601 timestamp."""
+    if isinstance(value, datetime):
+        return True
+    if not isinstance(value, str) or "T" not in value:
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return True
+    except ValueError:
+        return False
+
+
+def is_date_value(value: Any) -> bool:
+    """Return whether a value is a date object or an ISO-8601 date string."""
+    if isinstance(value, datetime):
+        return False
+    if isinstance(value, date):
+        return True
+    if not isinstance(value, str):
+        return False
+    try:
+        date.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
+
+
+def coerce_value_for_column(value: Any, column_type: Any) -> Any:
+    """Convert recognized JSON strings to the Python type expected by PostgreSQL."""
+    if value is None:
+        return None
+    if isinstance(column_type, DateTime) and isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if isinstance(column_type, Date) and isinstance(value, str):
+        return date.fromisoformat(value)
+    if isinstance(column_type, PG_UUID) and isinstance(value, str):
+        return UUID(value)
+    return value
 
 
 def column_names_in_request_order(rows: list[dict[str, Any]]) -> list[str]:
@@ -122,11 +176,16 @@ def table_from_rows(
 
 
 def normalized_rows(
-    rows: list[dict[str, Any]], column_names: list[str]
+    rows: list[dict[str, Any]], column_names: list[str], table: Table
 ) -> list[dict[str, Any]]:
-    """Give every insert row the same ordered column set, using NULL if absent."""
+    """Give rows one column set and coerce recognized values for their SQL type."""
     return [
-        {column_name: row.get(column_name) for column_name in column_names}
+        {
+            column_name: coerce_value_for_column(
+                row.get(column_name), table.c[column_name].type
+            )
+            for column_name in column_names
+        }
         for row in rows
     ]
 
@@ -238,7 +297,7 @@ def upsert_table(
             )
 
         unique_rows = deduplicate_rows_by_primary_key(request.rows, primary_key)
-        rows = normalized_rows(unique_rows, column_names)
+        rows = normalized_rows(unique_rows, column_names, table)
         if table_exists:
             existing_keys = set(
                 db.scalars(
@@ -290,4 +349,3 @@ def upsert_table(
         rows_inserted=rows_inserted,
         rows_updated=rows_updated,
     )
-
